@@ -10,9 +10,13 @@ use bevy::{
 };
 
 use crate::constraint::*;
+use crate::util::QuatExt;
 
 const DEFAULT_TARGET_SQ_THRESHOLD: f32 = 0.001;
 const DEFAULT_MAX_ITTERATIONS: usize = 10;
+
+/// The bone axis in local space.
+const BONE_AXIS: Vec3 = Vec3::Y;
 
 /// Wrapper for the [QueryEntityError] specifically for IK chain errors.
 /// Used to work around the [QueryEntityError] lifetime introduced in Bevy 0.15.
@@ -41,6 +45,15 @@ impl From<QueryEntityError<'_>> for IkChainError {
     }
 }
 
+/// Per-joint working data.
+struct JointData {
+    position: Vec3,
+    rotation: Quat,
+    length: f32,
+    forward_axis: Vec3,
+    up_axis: Vec3,
+}
+
 /// Main component that defines an IK chain. Add this to an end entity
 /// of a chain of entities to solve the chain's inverse kinematics.
 #[derive(Reflect)]
@@ -55,7 +68,6 @@ pub struct IkChain {
     pub max_iterations: usize,
     pub(crate) joint_count: usize,
     pub(crate) joint_lengths: Vec<f32>,
-    root_normal: Dir3,
 }
 
 impl Component for IkChain {
@@ -79,7 +91,6 @@ impl IkChain {
             max_iterations: DEFAULT_MAX_ITTERATIONS,
             joint_count,
             joint_lengths: vec![],
-            root_normal: Dir3::Y,
         }
     }
 
@@ -109,120 +120,164 @@ impl IkChain {
         )> = constraint_query.join_filtered(transform_query);
         let lens_query = constraint_lens.query();
 
-        // Collect joint transforms and constraints, if any
-        let mut joint_transforms: Vec<(GlobalTransform, Vec<&dyn Constraint>)> = vec![];
+        // Collect joint data. Index 0 = end effector (tip), last = root.
+        let mut joints: Vec<JointData> = Vec::with_capacity(self.joint_count);
+        let mut constraint_refs: Vec<Vec<&dyn Constraint>> = Vec::with_capacity(self.joint_count);
         let mut current_joint = *entity;
+
         for i in 0..self.joint_count {
             let (parent, global_transform, swing_constraint, twist_constraint) =
                 lens_query.get(current_joint)?;
 
-            let constraints = [
-                swing_constraint.map(|c| c as &dyn Constraint),
-                twist_constraint.map(|c| c as &dyn Constraint),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
+            let transform = global_transform.compute_transform();
 
-            joint_transforms.push((*global_transform, constraints));
+            let mut cs: Vec<&dyn Constraint> = Vec::new();
+            if let Some(sc) = swing_constraint {
+                cs.push(sc);
+            }
+            if let Some(tc) = twist_constraint {
+                cs.push(tc);
+            }
 
-            // We don't need the root joint's parent
+            // Compute the forward axis: direction from parent to this joint in
+            // parent's local space.
+            let forward_axis = if i < self.joint_count - 1 {
+                let local_transform = transform_query.get(current_joint).map(|(_, t, _)| t)?;
+                local_transform.translation.normalize_or(BONE_AXIS)
+            } else {
+                BONE_AXIS
+            };
+
+            joints.push(JointData {
+                position: global_transform.translation(),
+                rotation: transform.rotation,
+                length: if i < self.joint_lengths.len() {
+                    self.joint_lengths[i]
+                } else {
+                    0.0
+                },
+                forward_axis,
+                up_axis: Vec3::Z,
+            });
+            constraint_refs.push(cs);
+
+            // Move to parent
             if i < self.joint_count - 1 {
                 current_joint = **parent.unwrap();
             }
         }
 
-        // Solve
+        // FABRIK iterations
         for _ in 0..self.max_iterations {
-            if self
-                .target
-                .distance_squared(joint_transforms.first().unwrap().0.translation())
-                < self.threshold
-            {
+            if self.target.distance_squared(joints[0].position) < self.threshold {
                 break;
             }
 
-            self.backward_pass(&mut joint_transforms[..]);
-            self.forward_pass(&mut joint_transforms[..]);
+            self.backward_pass(&mut joints);
+            self.forward_pass(&mut joints, &constraint_refs);
         }
 
-        // Apply the transforms
+        // Apply the solved positions and rotations back to the transforms.
+        // joints[0] = end effector, joints[last] = root.
         let mut current_joint = *entity;
         for i in 0..self.joint_count - 1 {
             let (parent, mut transform, _) = transform_query.get_mut(current_joint)?;
-            let updated_transform = joint_transforms[i]
-                .0
-                .reparented_to(&joint_transforms[i + 1].0);
-            transform.translation = updated_transform.translation;
-            transform.rotation = updated_transform.rotation;
+
+            // Convert world-space position/rotation to local space relative to parent.
+            // Parent in the chain is joints[i+1].
+            let parent_gt: GlobalTransform = Affine3A {
+                matrix3: bevy::math::Mat3A::from_quat(joints[i + 1].rotation),
+                translation: Vec3A::from(joints[i + 1].position),
+            }
+            .into();
+
+            let child_gt: GlobalTransform = Affine3A {
+                matrix3: bevy::math::Mat3A::from_quat(joints[i].rotation),
+                translation: Vec3A::from(joints[i].position),
+            }
+            .into();
+
+            let local = child_gt.reparented_to(&parent_gt);
+            transform.translation = local.translation;
+            transform.rotation = local.rotation;
+
             current_joint = **parent.unwrap();
         }
 
         Ok(())
     }
 
-    fn backward_pass(&self, joints: &mut [(GlobalTransform, Vec<&dyn Constraint>)]) {
-        let origin = joints.last().unwrap().0.translation();
+    fn backward_pass(&self, joints: &mut [JointData]) {
+        let root_idx = joints.len() - 1;
 
-        joints[0].0 = Affine3A {
-            matrix3: joints[0].0.affine().matrix3,
-            translation: Vec3A::from(self.target),
-        }
-        .into();
+        // Save root position to restore later
+        let root_origin = joints[root_idx].position;
 
+        // Set end effector to target
+        joints[0].position = self.target;
+
+        // Reposition each joint toward root
         for i in 1..joints.len() {
-            let direction: Vec3A = (joints[i].0.translation() - joints[i - 1].0.translation())
-                .normalize()
-                .into();
-
-            joints[i].0 = Affine3A {
-                matrix3: joints[i - 1].0.affine().matrix3,
-                translation: joints[i - 1].0.affine().translation
-                    + direction * self.joint_lengths[i - 1],
-            }
-            .into();
+            let direction = (joints[i].position - joints[i - 1].position).normalize();
+            joints[i].position = joints[i - 1].position + direction * joints[i - 1].length;
         }
 
-        // Set root transform back to origin
-        joints.last_mut().unwrap().0 = Affine3A {
-            matrix3: joints.last().unwrap().0.affine().matrix3,
-            translation: origin.into(),
-        }
-        .into();
+        // Restore root to its original position
+        joints[root_idx].position = root_origin;
     }
 
-    fn forward_pass(&self, joints: &mut [(GlobalTransform, Vec<&dyn Constraint>)]) {
-        let root_end_index = joints.len() - 2;
+    fn forward_pass(&self, joints: &mut [JointData], constraints: &[Vec<&dyn Constraint>]) {
+        let root_idx = joints.len() - 1;
 
-        joints[root_end_index].0 = Affine3A {
-            matrix3: joints[root_end_index].0.affine().matrix3,
-            translation: joints.last().unwrap().0.affine().translation
-                + Vec3A::from(self.root_normal * self.joint_lengths[root_end_index]),
+        joints[root_idx - 1].position = joints[root_idx].position
+            + joints[root_idx].rotation * BONE_AXIS * joints[root_idx - 1].length;
+
+        for i in (1..root_idx).rev() {
+            let direction = (joints[i - 1].position - joints[i].position).normalize();
+
+            let (lower, upper) = joints.split_at_mut(i + 1);
+            let parent_rotation = upper[0].rotation;
+            let joint = &mut lower[i];
+            apply_constraints(joint, parent_rotation, direction, &constraints[i]);
+
+            joints[i - 1].position =
+                joints[i].position + joints[i].rotation * BONE_AXIS * joints[i - 1].length;
         }
-        .into();
 
-        for i in (0..root_end_index).rev() {
-            let child_transform = joints[i + 1].0;
-            let parent_transform = joints[i].0;
-
-            let direction =
-                (parent_transform.translation() - child_transform.translation()).normalize();
-
-            joints[i + 1].0 = rotate_and_constrain(
-                direction,
-                self.root_normal.into(),
-                child_transform,
-                &joints[i + 1].1,
-            );
-
-            joints[i].0 = Affine3A {
-                matrix3: parent_transform.affine().matrix3,
-                translation: joints[i + 1].0.affine().translation
-                    + Vec3A::from(joints[i + 1].0.up() * self.joint_lengths[i + 1]),
-            }
-            .into();
+        let tip_dir = (joints[0].position - joints[1].position).normalize();
+        if tip_dir.length_squared() > 0.0 {
+            joints[0].rotation = Quat::look_rotation_y(tip_dir, joints[1].rotation * Vec3::Z);
         }
     }
+}
+
+fn apply_constraints(
+    joint: &mut JointData,
+    parent_rotation: Quat,
+    direction: Vec3,
+    constraints: &[&dyn Constraint],
+) {
+    if constraints.is_empty() {
+        joint.rotation = Quat::look_rotation_y(direction, Vec3::Z);
+        return;
+    }
+
+    let constraint_forward = parent_rotation * joint.forward_axis;
+    let constraint_up = parent_rotation * joint.up_axis;
+    let rotation_global = Quat::look_rotation_y(constraint_forward, constraint_up);
+
+    let target_rotation = Quat::look_rotation_y(direction, Vec3::Z);
+
+    // Local rotation relative to the constraint reference frame
+    let rotation_local = rotation_global.inverse() * target_rotation;
+
+    let (mut twist, mut swing) = rotation_local.decompose(BONE_AXIS);
+    constraints.iter().for_each(|constraint| {
+        (swing, twist) = constraint.apply(swing, twist);
+    });
+
+    // Reconstruct world rotation
+    joint.rotation = rotation_global * swing * twist;
 }
 
 fn ik_chain_insert_hook(mut world: DeferredWorld, entity: Entity, _component_id: ComponentId) {
@@ -232,8 +287,6 @@ fn ik_chain_insert_hook(mut world: DeferredWorld, entity: Entity, _component_id:
         panic!("IK chain must have at least 2 joints.");
     }
 
-    // We'll use the last value later as root normal
-    let mut joint_normal = Vec3::ZERO;
     let mut tail = entity;
     let mut lengths = Vec::<f32>::with_capacity(joint_count - 1);
 
@@ -265,8 +318,8 @@ fn ik_chain_insert_hook(mut world: DeferredWorld, entity: Entity, _component_id:
             transform.translation()
         };
 
-        joint_normal = tail_pos - joint_pos;
-        lengths.push(joint_normal.length());
+        let diff = tail_pos - joint_pos;
+        lengths.push(diff.length());
         tail = joint;
     }
     let Some(mut chain) = world.get_mut::<IkChain>(entity) else {
@@ -277,5 +330,4 @@ fn ik_chain_insert_hook(mut world: DeferredWorld, entity: Entity, _component_id:
     };
 
     chain.joint_lengths = lengths;
-    chain.root_normal = Dir3::new_unchecked(joint_normal.normalize_or(Vec3::Y));
 }
