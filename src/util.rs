@@ -24,11 +24,16 @@ impl QuatExt for Quat {
         if vector.length_squared() > sqr_magnitude {
             vector = vector.normalize() * magnitude;
 
+            // When w is very close to zero (rotation near 180deg), signum(0.0)
+            // returns 0.0 which would produce a non-unit quaternion. Treat
+            // near-zero w as positive to avoid this.
+            let w_sign = if rotation.w >= 0.0 { 1.0 } else { -1.0 };
+
             return Quat::from_xyzw(
                 vector.x,
                 vector.y,
                 vector.z,
-                f32::sqrt(1.0 - sqr_magnitude) * f32::signum(rotation.w),
+                f32::sqrt(1.0 - sqr_magnitude) * w_sign,
             );
         }
         rotation
