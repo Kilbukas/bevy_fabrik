@@ -18,6 +18,7 @@ bevy = { version = "0.15", default-features = false, features = [
     "bevy_winit",
     "bevy_pbr",
     "tonemapping_luts",
+    "wayland",
 ] }
 
 [lints.clippy]
